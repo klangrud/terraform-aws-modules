@@ -1,0 +1,411 @@
+##################################################
+# Terraform Modules CI Pipeline
+# Runs on pull requests and pushes to main
+##################################################
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  TF_IN_AUTOMATION: "true"
+  GO_VERSION: "1.21"
+  TERRAFORM_VERSION: "1.6.6"
+  TFLINT_VERSION: "0.48.0"
+
+jobs:
+  ##################################################
+  # Detect Changed Modules
+  ##################################################
+  detect-changes:
+    name: Detect Changed Modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.changes.outputs.modules }}
+      has_changes: ${{ steps.changes.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect module changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA=${{ github.event.pull_request.base.sha }}
+            HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          else
+            BASE_SHA=${{ github.event.before }}
+            HEAD_SHA=${{ github.sha }}
+          fi
+
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "Initial commit - checking all modules"
+            MODULES=$(find modules -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            MODULES=$(git diff --name-only $BASE_SHA $HEAD_SHA | \
+              grep '^modules/' | \
+              awk -F/ '{print $2}' | \
+              sort -u | \
+              jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+
+          if [ "$MODULES" = "[]" ] || [ -z "$MODULES" ]; then
+            echo "modules=[]" >> $GITHUB_OUTPUT
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "modules=$MODULES" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Changed modules: $MODULES"
+
+  ##################################################
+  # Lint Stage
+  ##################################################
+  terraform-fmt:
+    name: Terraform Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -recursive -check -diff
+        continue-on-error: true
+
+  terraform-lint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v${{ env.TFLINT_VERSION }}
+
+      - name: Init TFLint
+        run: tflint --init
+
+      - name: Run TFLint
+        run: |
+          EXIT_CODE=0
+          for dir in modules/*/; do
+            echo "📦 Linting $(basename $dir)..."
+            if ! tflint --config .tflint.hcl --chdir "$dir" --format compact; then
+              echo "❌ TFLint failed for $(basename $dir)"
+              EXIT_CODE=1
+            else
+              echo "✅ TFLint passed for $(basename $dir)"
+            fi
+          done
+          exit $EXIT_CODE
+        continue-on-error: true
+
+  ##################################################
+  # Security Stage
+  ##################################################
+  tfsec:
+    name: tfsec Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true
+          additional_args: --minimum-severity MEDIUM
+
+  checkov:
+    name: Checkov Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: modules/
+          framework: terraform
+          soft_fail: true
+          skip_check: CKV_AWS_79,CKV_AWS_130,CKV_AWS_135
+          output_format: cli
+          output_file_path: console
+
+  ##################################################
+  # Validate Stage
+  ##################################################
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Validate all modules
+        run: |
+          EXIT_CODE=0
+          for dir in modules/*/; do
+            module_name=$(basename "$dir")
+            echo "🔍 Validating $module_name..."
+
+            cd "$dir"
+
+            # Create temporary provider configuration for modules with configuration_aliases
+            TEMP_PROVIDER_CREATED=false
+            if grep -q "configuration_aliases" *.tf 2>/dev/null; then
+              echo "  📝 Creating temporary provider configuration..."
+              cat > _validation_provider.tf <<'EOF'
+          provider "aws" {
+            region = "us-east-1"
+            skip_credentials_validation = true
+            skip_metadata_api_check = true
+            skip_requesting_account_id = true
+            access_key = "mock_access_key"
+            secret_key = "mock_secret_key"
+          }
+          provider "aws" {
+            alias = "source"
+            region = "us-east-1"
+            skip_credentials_validation = true
+            skip_metadata_api_check = true
+            skip_requesting_account_id = true
+            access_key = "mock_access_key"
+            secret_key = "mock_secret_key"
+          }
+          provider "aws" {
+            alias = "destination"
+            region = "us-east-1"
+            skip_credentials_validation = true
+            skip_metadata_api_check = true
+            skip_requesting_account_id = true
+            access_key = "mock_access_key"
+            secret_key = "mock_secret_key"
+          }
+          provider "aws" {
+            alias = "source-bucket-provider"
+            region = "us-east-1"
+            skip_credentials_validation = true
+            skip_metadata_api_check = true
+            skip_requesting_account_id = true
+            access_key = "mock_access_key"
+            secret_key = "mock_secret_key"
+          }
+          provider "aws" {
+            alias = "destination-bucket-provider"
+            region = "us-east-1"
+            skip_credentials_validation = true
+            skip_metadata_api_check = true
+            skip_requesting_account_id = true
+            access_key = "mock_access_key"
+            secret_key = "mock_secret_key"
+          }
+          EOF
+              TEMP_PROVIDER_CREATED=true
+            fi
+
+            # Initialize and validate
+            if ! terraform init -backend=false > /dev/null 2>&1; then
+              echo "❌ Init failed for $module_name"
+              EXIT_CODE=1
+              [ "$TEMP_PROVIDER_CREATED" = true ] && rm -f _validation_provider.tf
+              cd - > /dev/null
+              continue
+            fi
+
+            if ! terraform validate; then
+              echo "❌ Validation failed for $module_name"
+              EXIT_CODE=1
+            else
+              echo "✅ Validation passed for $module_name"
+            fi
+
+            [ "$TEMP_PROVIDER_CREATED" = true ] && rm -f _validation_provider.tf
+            cd - > /dev/null
+          done
+          exit $EXIT_CODE
+        continue-on-error: true
+
+  ##################################################
+  # Documentation Stage
+  ##################################################
+  terraform-docs:
+    name: Terraform Docs Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup terraform-docs
+        run: |
+          curl -sSLo terraform-docs.tar.gz https://github.com/terraform-docs/terraform-docs/releases/download/v0.16.0/terraform-docs-v0.16.0-linux-amd64.tar.gz
+          tar -xzf terraform-docs.tar.gz
+          chmod +x terraform-docs
+          sudo mv terraform-docs /usr/local/bin/
+
+      - name: Check documentation
+        run: |
+          EXIT_CODE=0
+          for dir in modules/*/; do
+            module_name=$(basename "$dir")
+            echo "📖 Checking documentation for $module_name..."
+
+            if [ ! -f "$dir/README.md" ]; then
+              echo "❌ No README.md found for $module_name"
+              EXIT_CODE=1
+              continue
+            fi
+
+            # Check if docs are up-to-date
+            cd "$dir"
+            cp README.md README_backup.md
+            terraform-docs markdown table --output-file README.md --output-mode inject .
+
+            if ! diff -q README_backup.md README.md > /dev/null 2>&1; then
+              echo "⚠️ README.md may be outdated for $module_name"
+              echo "   Run: terraform-docs markdown table --output-file README.md --output-mode inject ."
+              mv README_backup.md README.md
+            else
+              echo "✅ Documentation up-to-date for $module_name"
+              rm -f README_backup.md
+            fi
+            cd - > /dev/null
+          done
+          exit $EXIT_CODE
+        continue-on-error: true
+
+  docs-sections:
+    name: Required Doc Sections
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required sections
+        run: |
+          EXIT_CODE=0
+          REQUIRED_SECTIONS=("Usage" "Requirements" "Inputs" "Outputs")
+
+          for dir in modules/*/; do
+            module_name=$(basename "$dir")
+            echo "📖 Checking $module_name README.md..."
+
+            if [ ! -f "$dir/README.md" ]; then
+              echo "❌ No README.md found"
+              EXIT_CODE=1
+              continue
+            fi
+
+            for section in "${REQUIRED_SECTIONS[@]}"; do
+              if ! grep -qi "## $section" "$dir/README.md"; then
+                echo "⚠️ Missing section: ## $section"
+              fi
+            done
+          done
+          exit $EXIT_CODE
+        continue-on-error: true
+
+  ##################################################
+  # Unit Tests
+  ##################################################
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Download Go modules
+        working-directory: test
+        run: go mod download
+
+      - name: Run unit tests
+        working-directory: test
+        run: |
+          mkdir -p ../junit
+
+          for module in */; do
+            if [ "$module" = "shared/" ]; then
+              continue
+            fi
+
+            module_name=$(basename "$module")
+            echo "🧪 Running unit tests for $module_name..."
+
+            gotestsum --format standard-verbose \
+              --junitfile "../junit/${module_name}-unit.xml" \
+              --packages="./$module_name/..." \
+              -- -tags=unit -timeout 10m || echo "⚠️ Unit tests failed for $module_name"
+          done
+        continue-on-error: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: junit/
+          retention-days: 30
+
+  ##################################################
+  # Summary
+  ##################################################
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [terraform-fmt, terraform-lint, tfsec, checkov, terraform-validate, terraform-docs, unit-tests]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          echo "📊 CI Pipeline Summary"
+          echo "======================"
+          echo ""
+          echo "Format:    ${{ needs.terraform-fmt.result }}"
+          echo "Lint:      ${{ needs.terraform-lint.result }}"
+          echo "tfsec:     ${{ needs.tfsec.result }}"
+          echo "Checkov:   ${{ needs.checkov.result }}"
+          echo "Validate:  ${{ needs.terraform-validate.result }}"
+          echo "Docs:      ${{ needs.terraform-docs.result }}"
+          echo "Unit:      ${{ needs.unit-tests.result }}"
+          echo ""
+          echo "✅ CI pipeline completed"

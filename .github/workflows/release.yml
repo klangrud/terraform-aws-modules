@@ -213,6 +213,49 @@ jobs:
 
           echo "✅ Created and pushed tag: ${{ needs.version.outputs.version }}"
 
+      - name: Update CHANGELOG.md
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          NEW_VERSION: ${{ needs.version.outputs.version }}
+          PREV_VERSION: ${{ needs.version.outputs.previous_version }}
+          REPO: ${{ github.repository }}
+        run: |
+          export TODAY=$(date +%Y-%m-%d)
+
+          python3 - <<'PYEOF'
+          import os
+
+          new_version = os.environ['NEW_VERSION']
+          prev_version = os.environ['PREV_VERSION']
+          repo = os.environ['REPO']
+          today = os.environ['TODAY']
+
+          with open('changelog.md') as f:
+              release_notes = f.read().strip()
+
+          with open('CHANGELOG.md') as f:
+              content = f.read()
+
+          new_section = f"## [{new_version}] - {today}\n\n{release_notes}\n\n"
+          content = content.replace("## [Unreleased]\n", f"## [Unreleased]\n\n{new_section}", 1)
+
+          old_link = f"[Unreleased]: https://github.com/{repo}/compare/{prev_version}...HEAD"
+          new_links = (
+              f"[Unreleased]: https://github.com/{repo}/compare/{new_version}...HEAD\n"
+              f"[{new_version}]: https://github.com/{repo}/compare/{prev_version}...{new_version}"
+          )
+          content = content.replace(old_link, new_links)
+
+          with open('CHANGELOG.md', 'w') as f:
+              f.write(content)
+
+          print(f"Updated CHANGELOG.md for {new_version}")
+          PYEOF
+
+          git add CHANGELOG.md
+          git commit -m "chore: update CHANGELOG.md for $NEW_VERSION [skip ci]"
+          git push origin main
+
       - name: Create GitHub Release
         if: steps.check_tag.outputs.exists == 'false'
         uses: softprops/action-gh-release@v1

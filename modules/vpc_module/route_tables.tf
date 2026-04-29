@@ -9,7 +9,7 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route" "public_internet" {
-  for_each = aws_route_table.public
+  for_each = var.create_internet_gateway ? aws_route_table.public : {}
 
   route_table_id         = each.value.id
   destination_cidr_block = "0.0.0.0/0"
@@ -44,5 +44,10 @@ resource "aws_route" "private_internet" {
 
   route_table_id         = each.value.id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.this[0].id
+  # each.key is the AZ of the private subnet's route table.
+  # In per-AZ mode, route to the NGW in the same AZ.
+  # In single mode, route everything through the one NGW in the first AZ.
+  nat_gateway_id = aws_nat_gateway.this[
+    var.nat_gateway_per_az ? each.key : local.all_azs[0]
+  ].id
 }

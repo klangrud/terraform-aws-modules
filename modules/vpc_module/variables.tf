@@ -48,6 +48,12 @@ variable "create_nat_gateway" {
   default     = true
 }
 
+variable "nat_gateway_per_az" {
+  description = "When true, creates one NAT Gateway per AZ where private subnets exist (high availability). When false (default), creates a single NAT Gateway in the first AZ (cost-optimized, single point of failure)."
+  type        = bool
+  default     = false
+}
+
 variable "create_vpc_flow_logs" {
   type        = bool
   default     = false

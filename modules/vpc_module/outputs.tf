@@ -25,8 +25,13 @@ output "private_subnet_ids" {
 }
 
 output "nat_gateway_id" {
-  description = "The ID of the NAT Gateway if created"
-  value       = try(aws_nat_gateway.this[0].id, null)
+  description = "The ID of the NAT Gateway in single-gateway mode. Null when nat_gateway_per_az is true or no gateway is created."
+  value       = (!var.nat_gateway_per_az && var.create_nat_gateway) ? aws_nat_gateway.this[local.all_azs[0]].id : null
+}
+
+output "nat_gateway_ids" {
+  description = "Map of AZ to NAT Gateway ID for all created NAT Gateways."
+  value       = { for az, ngw in aws_nat_gateway.this : az => ngw.id }
 }
 
 output "internet_gateway_id" {

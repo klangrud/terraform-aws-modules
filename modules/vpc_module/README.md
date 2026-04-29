@@ -246,6 +246,34 @@ Subnets are automatically distributed across availability zones:
 - **RDS Subnets**: Private routing (no direct internet access)
 - **Custom Subnets**: Public or private routing based on configuration
 
+## Cost Considerations
+
+### S3 and DynamoDB: Use Free Gateway Endpoints
+
+By default, traffic from private subnets to S3 or DynamoDB routes through the NAT Gateway. AWS charges **~$0.045 per GB** of data processed by the NAT Gateway, which adds up quickly for workloads that read/write S3 frequently (e.g., application logs, ML training data, container image layers via ECR backed by S3).
+
+**S3 and DynamoDB Gateway Endpoints are free.** Adding them bypasses the NAT Gateway entirely for that traffic, routing it directly over the AWS backbone instead.
+
+```hcl
+module "vpc" {
+  # ...
+  vpc_endpoints = ["s3", "dynamodb"]
+}
+```
+
+This is one of the highest-value, lowest-effort cost optimizations available in AWS networking. It is strongly recommended for any VPC where private subnets access S3 or DynamoDB.
+
+### NAT Gateway High Availability vs. Cost
+
+The `nat_gateway_per_az` variable controls the availability/cost tradeoff for outbound internet access from private subnets:
+
+| Setting | NAT Gateways | Cost | Availability |
+|---|---|---|---|
+| `nat_gateway_per_az = false` (default) | 1 | Lower | Single point of failure |
+| `nat_gateway_per_az = true` | 1 per AZ | Higher | Survives AZ failure |
+
+For production workloads, per-AZ gateways are recommended. For dev/test, a single gateway is usually sufficient.
+
 ## Best Practices
 
 1. **Choose the Right VPC Size**: Use the [Supported VPC CIDR Sizes](#supported-vpc-cidr-sizes) table to select an appropriate size:
@@ -263,7 +291,7 @@ Subnets are automatically distributed across availability zones:
 - **VPC CIDR Size**: Must be between /16 and /24 (smaller VPCs cannot support AWS minimum subnet size)
 - **Maximum Subnets**: 6 subnets per type (limited by AZ count in most regions)
 - **NAT Gateway**: Creates a single gateway in the first public subnet (not HA by default)
-- **VPC Endpoints**: Interface endpoints only (not gateway endpoints)
+- **VPC Endpoints**: Gateway endpoints (S3, DynamoDB) and Interface endpoints are both supported
 - **Small VPC Considerations**: For /21-/24 VPCs, RDS and custom subnets use /28 (16 IPs, 11 usable)
 
 ## Related Documentation

@@ -68,6 +68,12 @@ data "aws_subnet" "selected" {
   id = var.subnet_ids[count.index]
 }
 
+data "aws_vpc" "selected" {
+  count = var.create_security_group ? 1 : 0
+
+  id = var.vpc_id
+}
+
 ############################################
 # Security Group (Optional)
 ############################################
@@ -79,13 +85,13 @@ resource "aws_security_group" "ec2_sg" {
   description = "Security group for ${local.name_prefix} EC2 instances"
   vpc_id      = var.vpc_id
 
-  # Allow all outbound traffic
+  # Restrict outbound traffic to within the VPC instead of the entire internet
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
+    cidr_blocks = [data.aws_vpc.selected[0].cidr_block]
+    description = "Allow outbound traffic within the VPC only"
   }
 
   # SSH access
